@@ -4272,6 +4272,101 @@ func TestSystemBackend_ToolsRandom(t *testing.T) {
 	doRequest(req, true, "", 0)
 }
 
+func TestSystemBackend_ToolsShamir(t *testing.T) {
+	b := testSystemBackend(t)
+	input := base64.StdEncoding.EncodeToString([]byte("test"))
+
+	splitReq := logical.TestRequest(t, logical.UpdateOperation, "tools/shamir/split")
+	splitReq.Data = map[string]interface{}{
+		"input":     input,
+		"parts":     5,
+		"threshold": 3,
+		"format":    "base64",
+	}
+
+	splitResp, err := b.HandleRequest(namespace.RootContext(nil), splitReq)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	schema.ValidateResponse(
+		t,
+		schema.GetResponseSchema(t, b.(*SystemBackend).Route(splitReq.Path), splitReq.Operation),
+		splitResp,
+		true,
+	)
+	if splitResp.IsError() {
+		t.Fatalf("bad: got error response: %#v", *splitResp)
+	}
+
+	shares, ok := splitResp.Data["shares"].([]string)
+	if !ok {
+		t.Fatal("no shares key found in returned data")
+	}
+	if len(shares) != 5 {
+		t.Fatalf("expected 5 shares, got %d", len(shares))
+	}
+
+	combineReq := logical.TestRequest(t, logical.UpdateOperation, "tools/shamir/combine")
+	combineReq.Data = map[string]interface{}{
+		"parts":  []string{shares[0], shares[2], shares[4]},
+		"format": "base64",
+	}
+
+	combineResp, err := b.HandleRequest(namespace.RootContext(nil), combineReq)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	schema.ValidateResponse(
+		t,
+		schema.GetResponseSchema(t, b.(*SystemBackend).Route(combineReq.Path), combineReq.Operation),
+		combineResp,
+		true,
+	)
+	if combineResp.IsError() {
+		t.Fatalf("bad: got error response: %#v", *combineResp)
+	}
+
+	secretB64, ok := combineResp.Data["secret"].(string)
+	if !ok {
+		t.Fatal("no secret key found in returned data")
+	}
+	secret, err := base64.StdEncoding.DecodeString(secretB64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(secret) != "test" {
+		t.Fatalf("mismatched secret: got %q, expect %q", secret, "test")
+	}
+
+	// Test bad input
+	splitReq.Data["parts"] = 2
+	splitReq.Data["threshold"] = 3
+	splitResp, err = b.HandleRequest(namespace.RootContext(nil), splitReq)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if !splitResp.IsError() {
+		t.Fatalf("bad: expected error response")
+	}
+
+	splitReq.Data["parts"] = 5
+	splitReq.Data["threshold"] = 3
+	splitReq.Data["input"] = "not-base64"
+	splitResp, err = b.HandleRequest(namespace.RootContext(nil), splitReq)
+	if err == nil {
+		t.Fatalf("expected error for invalid base64 input")
+	}
+
+	combineReq.Data["parts"] = []string{shares[0]}
+	combineResp, err = b.HandleRequest(namespace.RootContext(nil), combineReq)
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+	if !combineResp.IsError() {
+		t.Fatalf("bad: expected error response")
+	}
+}
+
 func TestSystemBackend_InternalUIMounts(t *testing.T) {
 	_, b, rootToken := testCoreSystemBackend(t)
 	systemBackend := b.(*SystemBackend)

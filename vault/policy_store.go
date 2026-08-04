@@ -147,6 +147,12 @@ path "sys/tools/hash" {
 path "sys/tools/hash/*" {
     capabilities = ["update"]
 }
+path "sys/tools/shamir/split" {
+    capabilities = ["update"]
+}
+path "sys/tools/shamir/combine" {
+    capabilities = ["update"]
+}
 
 # Allow checking the status of a Control Group request if the user has the
 # accessor

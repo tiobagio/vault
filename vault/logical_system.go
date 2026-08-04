@@ -42,6 +42,7 @@ import (
 	"github.com/hashicorp/vault/helper/monitor"
 	"github.com/hashicorp/vault/helper/namespace"
 	"github.com/hashicorp/vault/helper/random"
+	"github.com/hashicorp/vault/helper/shamirapi"
 	"github.com/hashicorp/vault/helper/versions"
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/helper/consts"
@@ -4776,6 +4777,14 @@ func (b *SystemBackend) pathRandomWrite(_ context.Context, _ *logical.Request, d
 	return random.HandleRandomAPI(d, b.Core.secureRandomReader)
 }
 
+func (b *SystemBackend) pathShamirSplitWrite(_ context.Context, _ *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	return shamirapi.HandleSplitAPI(d)
+}
+
+func (b *SystemBackend) pathShamirCombineWrite(_ context.Context, _ *logical.Request, d *framework.FieldData) (*logical.Response, error) {
+	return shamirapi.HandleCombineAPI(d)
+}
+
 func hasMountAccess(ctx context.Context, acl *ACL, path string) bool {
 	ns, err := namespace.FromContext(ctx)
 	if err != nil {
@@ -6969,6 +6978,14 @@ This path responds to the following HTTP methods.
 	"random": {
 		"Generate random bytes",
 		"This function can be used to generate high-entropy random bytes.",
+	},
+	"shamir-split": {
+		"Split a secret using Shamir's Secret Sharing",
+		`Splits a secret into a configured number of shares using Shamir's Secret Sharing algorithm. A minimum threshold of shares is required to reconstruct the original secret.`,
+	},
+	"shamir-combine": {
+		"Combine Shamir shares into a secret",
+		`Combines Shamir shares into the original secret using Shamir's Secret Sharing algorithm.`,
 	},
 	"listing_visibility": {
 		"Determines the visibility of the mount in the UI-specific listing endpoint. Accepted value are 'unauth' and 'hidden', with the empty default ('') behaving like 'hidden'.",
