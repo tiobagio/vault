@@ -107,6 +107,16 @@ func TestSystemBackend_InternalUIResultantACL(t *testing.T) {
 					"update",
 				},
 			},
+			"sys/tools/shamir/split": map[string]interface{}{
+				"capabilities": []interface{}{
+					"update",
+				},
+			},
+			"sys/tools/shamir/combine": map[string]interface{}{
+				"capabilities": []interface{}{
+					"update",
+				},
+			},
 			"sys/wrapping/lookup": map[string]interface{}{
 				"capabilities": []interface{}{
 					"update",

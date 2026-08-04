@@ -2575,6 +2575,96 @@ func (b *SystemBackend) toolsPaths() []*framework.Path {
 			HelpSynopsis:    strings.TrimSpace(sysHelp["random"][0]),
 			HelpDescription: strings.TrimSpace(sysHelp["random"][1]),
 		},
+
+		{
+			Pattern: "tools/shamir/split",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationVerb:   "generate",
+				OperationSuffix: "shamir-split",
+			},
+
+			Fields: map[string]*framework.FieldSchema{
+				"input": {
+					Type:        framework.TypeString,
+					Description: "The base64-encoded secret to split",
+				},
+				"parts": {
+					Type:        framework.TypeInt,
+					Description: "The number of shares to generate (N)",
+				},
+				"threshold": {
+					Type:        framework.TypeInt,
+					Description: "The number of shares required to reconstruct the secret (T)",
+				},
+				"format": {
+					Type:        framework.TypeString,
+					Default:     "base64",
+					Description: `Encoding format to use for returned shares. Can be "hex" or "base64". Defaults to "base64".`,
+				},
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback: b.pathShamirSplitWrite,
+					Responses: map[int][]framework.Response{
+						http.StatusOK: {{
+							Description: "OK",
+							Fields: map[string]*framework.FieldSchema{
+								"shares": {
+									Type:     framework.TypeStringSlice,
+									Required: true,
+								},
+							},
+						}},
+					},
+				},
+			},
+
+			HelpSynopsis:    strings.TrimSpace(sysHelp["shamir-split"][0]),
+			HelpDescription: strings.TrimSpace(sysHelp["shamir-split"][1]),
+		},
+
+		{
+			Pattern: "tools/shamir/combine",
+
+			DisplayAttrs: &framework.DisplayAttributes{
+				OperationVerb:   "generate",
+				OperationSuffix: "shamir-combine",
+			},
+
+			Fields: map[string]*framework.FieldSchema{
+				"parts": {
+					Type:        framework.TypeStringSlice,
+					Description: "The encoded shares to combine",
+				},
+				"format": {
+					Type:        framework.TypeString,
+					Default:     "base64",
+					Description: `Encoding format of the provided shares and returned secret. Can be "hex" or "base64". Defaults to "base64".`,
+				},
+			},
+
+			Operations: map[logical.Operation]framework.OperationHandler{
+				logical.UpdateOperation: &framework.PathOperation{
+					Callback: b.pathShamirCombineWrite,
+					Responses: map[int][]framework.Response{
+						http.StatusOK: {{
+							Description: "OK",
+							Fields: map[string]*framework.FieldSchema{
+								"secret": {
+									Type:     framework.TypeString,
+									Required: true,
+								},
+							},
+						}},
+					},
+				},
+			},
+
+			HelpSynopsis:    strings.TrimSpace(sysHelp["shamir-combine"][0]),
+			HelpDescription: strings.TrimSpace(sysHelp["shamir-combine"][1]),
+		},
 	}
 }
 
