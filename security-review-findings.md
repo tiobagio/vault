@@ -130,6 +130,89 @@ User lockout does **not** apply to RADIUS (`GetSupportedUserLockoutsAuthMethods`
 
 ---
 
+## Finding 3 — HIGH — Unauthenticated DoS of `sys/generate-root` and `sys/rekey` (single-slot lock)
+
+**Maps to:** CVE-2026-5807 / HCSEC-2026-08 (**unfixed in this tree**; fixed upstream in Vault 2.0.0)  
+**Primary locations:** `http/sys_generate_root.go`, `http/sys_rekey.go`, `vault/logical_system.go` (`PathsSpecial.Unauthenticated`), `vault/generate_root.go`, `vault/rekey.go`
+
+### Attacker
+Any network client that can reach the Vault API — **no token required**.
+
+### Controlled input
+Unauthenticated HTTP `PUT`/`DELETE` (and status `GET`) on:
+- `/v1/sys/generate-root/attempt`
+- `/v1/sys/rekey/init`
+- `/v1/sys/rekey-recovery-key/init`
+
+### Reachability
+These routes are registered on the HTTP mux **outside** logical ACL enforcement and are explicitly listed as unauthenticated:
+
+```172:181:vault/logical_system.go
+				"generate-root/attempt",
+				"generate-root/update",
+				"decode-token",
+				"rekey/init",
+				"rekey/update",
+				"rekey/verify",
+				"rekey-recovery-key/init",
+				"rekey-recovery-key/update",
+				"rekey-recovery-key/verify",
+```
+
+```190:199:http/handler.go
+		mux.Handle("/v1/sys/generate-root/attempt", handleRequestForwarding(core,
+			handleAuditNonLogical(core, handleSysGenerateRootAttempt(core, vault.GenerateStandardRootTokenStrategy))))
+		mux.Handle("/v1/sys/generate-root/update", handleRequestForwarding(core,
+			handleAuditNonLogical(core, handleSysGenerateRootUpdate(core, vault.GenerateStandardRootTokenStrategy))))
+		mux.Handle("/v1/sys/rekey/init", handleRequestForwarding(core, handleSysRekeyInit(core, false)))
+		mux.Handle("/v1/sys/rekey/update", handleRequestForwarding(core, handleSysRekeyUpdate(core, false)))
+		mux.Handle("/v1/sys/rekey/verify", handleRequestForwarding(core, handleSysRekeyVerify(core, false)))
+		mux.Handle("/v1/sys/rekey-recovery-key/init", handleRequestForwarding(core, handleSysRekeyInit(core, true)))
+```
+
+Handlers perform **no** token/policy check. Status is already exercised unauthenticated in-tree (`http.Get` without `X-Vault-Token` in `TestSysGenerateRootAttempt_Status` / cancel follow-up).
+
+### Root cause
+Only **one** generate-root (and one rekey) attempt may be in progress. Init refuses a second attempt; cancel clears it. Both init and cancel are unauthenticated state writes:
+
+```178:181:vault/generate_root.go
+	// Prevent multiple concurrent root generations
+	if c.generateRootConfig != nil {
+		return fmt.Errorf("root generation already in progress")
+	}
+```
+
+```105:129:http/sys_generate_root.go
+	// empty body → server generates OTP and returns it
+	genned = true
+	req.OTP, err = base62.Random(...)
+	...
+	if err := core.GenerateRootInit(req.OTP, req.PGPKey, generateStrategy); err != nil {
+```
+
+```135:141:http/sys_generate_root.go
+func handleSysGenerateRootAttemptDelete(...) {
+	err := core.GenerateRootCancel()
+	...
+	respondOk(w, nil)
+}
+```
+
+Same single-slot pattern for rekey (`BarrierRekeyInit` / `RecoveryRekeyInit` → `"rekey already in progress"`; `handleSysRekeyInitDelete` → `RekeyCancel`).
+
+### End-to-end attack path
+1. Attacker (no auth): `PUT /v1/sys/generate-root/attempt` with empty body → attempt started; response includes `nonce` + `otp`.
+2. Legitimate operator’s `PUT .../attempt` now fails with “root generation already in progress”.
+3. Attacker loops `DELETE /v1/sys/generate-root/attempt` then `PUT` again (or holds the slot) so operators never retain a stable ceremony.
+4. Same loop against `/v1/sys/rekey/init` and `/v1/sys/rekey-recovery-key/init` blocks unseal/recovery key rotation.
+
+Impact is availability of break-glass root regeneration and rekey (CVSS 7.5 per advisory: `AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H`). Does not by itself mint a root token without unseal-key quorum, but fully denies those workflows.
+
+### Why not deduped
+Known CVE list includes other 2026 issues (`3605`, `39946`, `5006`, `5052`) but **not** CVE-2026-5807 / HCSEC-2026-08.
+
+---
+
 ## Candidates reviewed that did **not** meet the bar (brief)
 
 | Area | Outcome |
@@ -144,14 +227,18 @@ User lockout does **not** apply to RADIUS (`GetSupportedUserLockoutsAuthMethods`
 | SSH `allowed_users_template` comma-split | **Already reported** |
 | RabbitMQ/Nomad/Consul | Role writers can grant strong remote privileges by design; no unintended injection path validated |
 | Okta `verify/<nonce>` | Unauthenticated by design; nonce from CLI is 20-char base62 — not a practical unauth MFA break without nonce leak |
-| DB engines | Known SQLi set excluded; no additional solid SQLi E2E beyond that set |
+| DB engines (MySQL/Cassandra/Mongo/Influx defaults) | Same QueryHelper class as excluded MSSQL/Redshift/HANA SQLi; Cassandra default template’s `replace "-" "_"` defeats naive `--` comment breakout within 15-char DisplayName without a clean SUPERUSER+password E2E under default template |
+| physical/mssql | Identifier regex present (CVE-2023-0620 class fixed); remaining LIKE `_`/`%` in keys not medium+ E2E |
+| X-Forwarded-For | RemoteAddr rewrite and client-cert import gated on `authorized_addrs`; in-flight XFF spoof is telemetry-only |
+| RADIUS MFA alias casing | **Dismissed** (case-insensitive identity index) |
 | Templated ACL slash injection | **Already reported** (CVE-2026-5006) |
 
 ---
 
 ## Summary
 
-**2 validated findings** outside the dedupe set:
+**3 validated findings** outside the dedupe set (Finding 2 dismissed by follow-up criteria):
 
 1. **HIGH** — Azure auth resource-bound bypass via unvalidated client `vm_name`/`vmss_name`/`resource_group_name` (CVE-2025-3879 present).
-2. **MEDIUM** — RADIUS raw username → divergent entity alias → Login MFA bypass.
+2. **MEDIUM** — RADIUS raw username → divergent entity alias → Login MFA bypass (**dismissed** — case-insensitive identity index).
+3. **HIGH** — Unauthenticated single-slot DoS of `sys/generate-root` and `sys/rekey` (CVE-2026-5807 present, not previously listed).
